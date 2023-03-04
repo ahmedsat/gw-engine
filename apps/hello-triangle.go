@@ -2,8 +2,10 @@ package apps
 
 import (
 	"embed"
-	"log"
 
+	"github.com/ahmedsat/gw-engine/log"
+
+	"github.com/ahmedsat/gw-engine/utils"
 	"github.com/cockroachdb/errors"
 	"github.com/veandco/go-sdl2/sdl"
 	"github.com/vkngwrapper/core/v2"
@@ -41,11 +43,11 @@ type SwapChainSupportDetails struct {
 
 type HelloTriangleApplication struct {
 	window *sdl.Window
-	loader core.Loader
+	loader core.Loader // ? Loader is the root object of vkng
 
-	instance       core1_0.Instance
+	instance       core1_0.Instance // ? Instance stores per-application state for Vulkan
 	debugMessenger ext_debug_utils.DebugUtilsMessenger
-	surface        khr_surface.Surface
+	surface        khr_surface.Surface // ? Surface abstracts native platform surface or window objects
 
 	physicalDevice core1_0.PhysicalDevice
 	device         core1_0.Device
@@ -97,7 +99,7 @@ func (app *HelloTriangleApplication) initWindow() error {
 		return err
 	}
 
-	window, err := sdl.CreateWindow("Vulkan", sdl.WINDOWPOS_UNDEFINED, sdl.WINDOWPOS_UNDEFINED, 800, 600, sdl.WINDOW_SHOWN|sdl.WINDOW_VULKAN)
+	window, err := sdl.CreateWindow("Vulkan", sdl.WINDOWPOS_UNDEFINED, sdl.WINDOWPOS_UNDEFINED, 800, 600, utils.SDL_WINDOW_FLAGS)
 	if err != nil {
 		return err
 	}
@@ -142,6 +144,11 @@ func (app *HelloTriangleApplication) initVulkan() error {
 		return err
 	}
 
+	err = app.createImageViews()
+	if err != nil {
+		return err
+	}
+
 	err = app.createRenderPass()
 	if err != nil {
 		return err
@@ -171,21 +178,39 @@ func (app *HelloTriangleApplication) initVulkan() error {
 }
 
 func (app *HelloTriangleApplication) mainLoop() error {
+	rendering := true
 appLoop:
 	for {
 		for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
-			switch ev := event.(type) {
+			switch e := event.(type) {
 			case *sdl.QuitEvent:
 				break appLoop
 			case *sdl.KeyboardEvent:
-				if ev.Keysym.Sym == sdl.K_ESCAPE {
+				if e.Keysym.Sym == sdl.K_ESCAPE {
 					sdl.PushEvent(&sdl.QuitEvent{Type: sdl.QUIT})
+				}
+			case *sdl.WindowEvent:
+				switch e.Event {
+				case sdl.WINDOWEVENT_MINIMIZED:
+					rendering = false
+				case sdl.WINDOWEVENT_RESTORED:
+					rendering = true
+				case sdl.WINDOWEVENT_RESIZED:
+					w, h := app.window.GetSize()
+					if w > 0 && h > 0 {
+						rendering = true
+						app.recreateSwapChain()
+					} else {
+						rendering = false
+					}
 				}
 			}
 		}
-		err := app.drawFrame()
-		if err != nil {
-			return err
+		if rendering {
+			err := app.drawFrame()
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -193,7 +218,48 @@ appLoop:
 	return err
 }
 
+func (app *HelloTriangleApplication) cleanupSwapChain() {
+
+	for _, framebuffer := range app.swapchainFramebuffers {
+		framebuffer.Destroy(nil)
+	}
+
+	app.swapchainFramebuffers = []core1_0.Framebuffer{}
+
+	if len(app.commandBuffers) > 0 {
+		app.device.FreeCommandBuffers(app.commandBuffers)
+		app.commandBuffers = []core1_0.CommandBuffer{}
+	}
+
+	if app.graphicsPipeline != nil {
+		app.graphicsPipeline.Destroy(nil)
+		app.graphicsPipeline = nil
+	}
+
+	if app.pipelineLayout != nil {
+		app.pipelineLayout.Destroy(nil)
+		app.pipelineLayout = nil
+	}
+
+	if app.renderPass != nil {
+		app.renderPass.Destroy(nil)
+		app.renderPass = nil
+	}
+
+	for _, imageView := range app.swapchainImageViews {
+		imageView.Destroy(nil)
+	}
+	app.swapchainImageViews = []core1_0.ImageView{}
+
+	if app.swapchain != nil {
+		app.swapchain.Destroy(nil)
+		app.swapchain = nil
+	}
+}
+
 func (app *HelloTriangleApplication) cleanup() {
+	app.cleanupSwapChain()
+
 	for _, fence := range app.inFlightFence {
 		fence.Destroy(nil)
 	}
@@ -208,30 +274,6 @@ func (app *HelloTriangleApplication) cleanup() {
 
 	if app.commandPool != nil {
 		app.commandPool.Destroy(nil)
-	}
-
-	for _, framebuffer := range app.swapchainFramebuffers {
-		framebuffer.Destroy(nil)
-	}
-
-	if app.graphicsPipeline != nil {
-		app.graphicsPipeline.Destroy(nil)
-	}
-
-	if app.pipelineLayout != nil {
-		app.pipelineLayout.Destroy(nil)
-	}
-
-	if app.renderPass != nil {
-		app.renderPass.Destroy(nil)
-	}
-
-	for _, imageView := range app.swapchainImageViews {
-		imageView.Destroy(nil)
-	}
-
-	if app.swapchain != nil {
-		app.swapchain.Destroy(nil)
 	}
 
 	if app.device != nil {
@@ -254,6 +296,60 @@ func (app *HelloTriangleApplication) cleanup() {
 		app.window.Destroy()
 	}
 	sdl.Quit()
+}
+
+func (app *HelloTriangleApplication) recreateSwapChain() error {
+	w, h := app.window.VulkanGetDrawableSize()
+	if w == 0 || h == 0 {
+		return nil
+	}
+	if (app.window.GetFlags() & sdl.WINDOW_MINIMIZED) != 0 {
+		return nil
+	}
+
+	_, err := app.device.WaitIdle()
+	if err != nil {
+		return err
+	}
+
+	app.cleanupSwapChain()
+
+	err = app.createSwapchain()
+	if err != nil {
+		return err
+	}
+
+	err = app.createImageViews()
+	if err != nil {
+		return err
+	}
+
+	err = app.createRenderPass()
+	if err != nil {
+		return err
+	}
+
+	err = app.createGraphicsPipeline()
+	if err != nil {
+		return err
+	}
+
+	err = app.createFramebuffers()
+	if err != nil {
+		return err
+	}
+
+	err = app.createCommandBuffers()
+	if err != nil {
+		return err
+	}
+
+	app.imagesInFlight = []core1_0.Fence{}
+	for i := 0; i < len(app.swapchainImages); i++ {
+		app.imagesInFlight = append(app.imagesInFlight, nil)
+	}
+
+	return nil
 }
 
 func (app *HelloTriangleApplication) createInstance() error {
@@ -475,7 +571,11 @@ func (app *HelloTriangleApplication) createSwapchain() error {
 	app.swapchain = swapchain
 	app.swapchainImageFormat = surfaceFormat.Format
 
-	images, _, err := swapchain.SwapchainImages()
+	return nil
+}
+
+func (app *HelloTriangleApplication) createImageViews() error {
+	images, _, err := app.swapchain.SwapchainImages()
 	if err != nil {
 		return err
 	}
@@ -486,7 +586,7 @@ func (app *HelloTriangleApplication) createSwapchain() error {
 		view, _, err := app.device.CreateImageView(nil, core1_0.ImageViewCreateInfo{
 			ViewType: core1_0.ImageViewType2D,
 			Image:    image,
-			Format:   surfaceFormat.Format,
+			Format:   app.swapchainImageFormat,
 			Components: core1_0.ComponentMapping{
 				R: core1_0.ComponentSwizzleIdentity,
 				G: core1_0.ComponentSwizzleIdentity,
@@ -830,13 +930,15 @@ func (app *HelloTriangleApplication) drawFrame() error {
 		return err
 	}
 
-	imageIndex, _, err := app.swapchain.AcquireNextImage(common.NoTimeout, app.imageAvailableSemaphore[app.currentFrame], nil)
-	if err != nil {
+	imageIndex, res, err := app.swapchain.AcquireNextImage(common.NoTimeout, app.imageAvailableSemaphore[app.currentFrame], nil)
+	if res == khr_swapchain.VKErrorOutOfDate {
+		return app.recreateSwapChain()
+	} else if err != nil {
 		return err
 	}
 
 	if app.imagesInFlight[imageIndex] != nil {
-		_, err := app.device.WaitForFences(true, common.NoTimeout, []core1_0.Fence{app.imagesInFlight[imageIndex]})
+		_, err := app.imagesInFlight[imageIndex].Wait(common.NoTimeout)
 		if err != nil {
 			return err
 		}
@@ -860,12 +962,14 @@ func (app *HelloTriangleApplication) drawFrame() error {
 		return err
 	}
 
-	_, err = app.swapchainExtension.QueuePresent(app.presentQueue, khr_swapchain.PresentInfo{
+	res, err = app.swapchainExtension.QueuePresent(app.presentQueue, khr_swapchain.PresentInfo{
 		WaitSemaphores: []core1_0.Semaphore{app.renderFinishedSemaphore[app.currentFrame]},
 		Swapchains:     []khr_swapchain.Swapchain{app.swapchain},
 		ImageIndices:   []int{imageIndex},
 	})
-	if err != nil {
+	if res == khr_swapchain.VKErrorOutOfDate || res == khr_swapchain.VKSuboptimal {
+		return app.recreateSwapChain()
+	} else if err != nil {
 		return err
 	}
 
@@ -1003,6 +1107,13 @@ func (app *HelloTriangleApplication) findQueueFamilies(device core1_0.PhysicalDe
 }
 
 func (app *HelloTriangleApplication) logDebug(msgType ext_debug_utils.DebugUtilsMessageTypeFlags, severity ext_debug_utils.DebugUtilsMessageSeverityFlags, data *ext_debug_utils.DebugUtilsMessengerCallbackData) bool {
-	log.Printf("[%s %s] - %s", severity, msgType, data.Message)
+
+	if severity&ext_debug_utils.SeverityError != 0 {
+		log.Error.Printf("[%s] - %s", msgType, data.Message)
+	}
+
+	if severity&ext_debug_utils.SeverityWarning != 0 {
+		log.Warning.Printf("[%s] - %s", msgType, data.Message)
+	}
 	return false
 }
