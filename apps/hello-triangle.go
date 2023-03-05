@@ -4,14 +4,13 @@ import (
 	"bytes"
 	"embed"
 	"encoding/binary"
+	"math"
 	"unsafe"
 
-	"github.com/ahmedsat/go-math-helper/math32/colors"
-	"github.com/ahmedsat/go-math-helper/math32/vectors"
 	"github.com/ahmedsat/gw-engine/log"
-
 	"github.com/ahmedsat/gw-engine/utils"
 	"github.com/cockroachdb/errors"
+	"github.com/loov/hrtime"
 	"github.com/veandco/go-sdl2/sdl"
 	"github.com/vkngwrapper/core/v2"
 	"github.com/vkngwrapper/core/v2/common"
@@ -22,6 +21,7 @@ import (
 	"github.com/vkngwrapper/extensions/v2/khr_surface"
 	"github.com/vkngwrapper/extensions/v2/khr_swapchain"
 	vkng_sdl2 "github.com/vkngwrapper/integrations/sdl2/v2"
+	vkngmath "github.com/vkngwrapper/math"
 )
 
 const MaxFramesInFlight = 2
@@ -47,8 +47,14 @@ type SwapChainSupportDetails struct {
 }
 
 type Vertex struct {
-	vectors.Vec3
-	colors.Color
+	Position vkngmath.Vec2[float32]
+	Color    vkngmath.Vec3[float32]
+}
+
+type UniformBufferObject struct {
+	Model vkngmath.Mat4x4[float32]
+	View  vkngmath.Mat4x4[float32]
+	Proj  vkngmath.Mat4x4[float32]
 }
 
 func getVertexBindingDescription() []core1_0.VertexInputBindingDescription {
@@ -69,14 +75,14 @@ func getVertexAttributeDescriptions() []core1_0.VertexInputAttributeDescription 
 		{
 			Binding:  0,
 			Location: 0,
-			Format:   core1_0.FormatR32G32SignedFloat,
-			Offset:   int(unsafe.Offsetof(v.X)),
+			Format:   core1_0.FormatR32G32B32SignedFloat,
+			Offset:   int(unsafe.Offsetof(v.Position)),
 		},
 		{
 			Binding:  0,
 			Location: 1,
 			Format:   core1_0.FormatR32G32B32SignedFloat,
-			Offset:   int(unsafe.Offsetof(v.R)),
+			Offset:   int(unsafe.Offsetof(v.Color)),
 		},
 	}
 }
@@ -103,9 +109,10 @@ type HelloTriangleApplication struct {
 	swapchainImageViews   []core1_0.ImageView
 	swapchainFramebuffers []core1_0.Framebuffer
 
-	renderPass       core1_0.RenderPass
-	pipelineLayout   core1_0.PipelineLayout
-	graphicsPipeline core1_0.Pipeline
+	renderPass          core1_0.RenderPass
+	descriptorSetLayout core1_0.DescriptorSetLayout
+	pipelineLayout      core1_0.PipelineLayout
+	graphicsPipeline    core1_0.Pipeline
 
 	commandPool    core1_0.CommandPool
 	commandBuffers []core1_0.CommandBuffer
@@ -115,11 +122,15 @@ type HelloTriangleApplication struct {
 	inFlightFence           []core1_0.Fence
 	imagesInFlight          []core1_0.Fence
 	currentFrame            int
+	frameStart              float64
 
 	vertexBuffer       core1_0.Buffer
 	vertexBufferMemory core1_0.DeviceMemory
 	indexBuffer        core1_0.Buffer
 	indexBufferMemory  core1_0.DeviceMemory
+
+	uniformBuffers       []core1_0.Buffer
+	uniformBuffersMemory []core1_0.DeviceMemory
 
 	Shaders  embed.FS
 	Vertices []Vertex
@@ -201,6 +212,11 @@ func (app *HelloTriangleApplication) initVulkan() error {
 		return err
 	}
 
+	err = app.createDescriptorSetLayout()
+	if err != nil {
+		return err
+	}
+
 	err = app.createGraphicsPipeline()
 	if err != nil {
 		return err
@@ -222,6 +238,11 @@ func (app *HelloTriangleApplication) initVulkan() error {
 	}
 
 	err = app.createIndexBuffer()
+	if err != nil {
+		return err
+	}
+
+	err = app.createUniformBuffers()
 	if err != nil {
 		return err
 	}
@@ -312,10 +333,26 @@ func (app *HelloTriangleApplication) cleanupSwapChain() {
 		app.swapchain.Destroy(nil)
 		app.swapchain = nil
 	}
+
+	for i := 0; i < len(app.uniformBuffers); i++ {
+		app.uniformBuffers[i].Destroy(nil)
+	}
+	app.uniformBuffers = app.uniformBuffers[:0]
+
+	for i := 0; i < len(app.uniformBuffersMemory); i++ {
+		app.uniformBuffersMemory[i].Free(nil)
+	}
+	app.uniformBuffersMemory = app.uniformBuffersMemory[:0]
+
 }
 
 func (app *HelloTriangleApplication) cleanup() {
 	app.cleanupSwapChain()
+
+	if app.descriptorSetLayout != nil {
+		app.descriptorSetLayout.Destroy(nil)
+	}
+
 	if app.indexBuffer != nil {
 		app.indexBuffer.Destroy(nil)
 	}
@@ -407,6 +444,11 @@ func (app *HelloTriangleApplication) recreateSwapChain() error {
 	}
 
 	err = app.createFramebuffers()
+	if err != nil {
+		return err
+	}
+
+	err = app.createUniformBuffers()
 	if err != nil {
 		return err
 	}
@@ -731,6 +773,26 @@ func (app *HelloTriangleApplication) createRenderPass() error {
 	return nil
 }
 
+func (app *HelloTriangleApplication) createDescriptorSetLayout() error {
+	var err error
+	app.descriptorSetLayout, _, err = app.device.CreateDescriptorSetLayout(nil, core1_0.DescriptorSetLayoutCreateInfo{
+		Bindings: []core1_0.DescriptorSetLayoutBinding{
+			{
+				Binding:         0,
+				DescriptorType:  core1_0.DescriptorTypeUniformBuffer,
+				DescriptorCount: 1,
+
+				StageFlags: core1_0.StageVertex,
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func bytesToBytecode(b []byte) []uint32 {
 	byteCode := make([]uint32, len(b)/4)
 	for i := 0; i < len(byteCode); i++ {
@@ -847,7 +909,11 @@ func (app *HelloTriangleApplication) createGraphicsPipeline() error {
 		},
 	}
 
-	app.pipelineLayout, _, err = app.device.CreatePipelineLayout(nil, core1_0.PipelineLayoutCreateInfo{})
+	app.pipelineLayout, _, err = app.device.CreatePipelineLayout(nil, core1_0.PipelineLayoutCreateInfo{
+		SetLayouts: []core1_0.DescriptorSetLayout{
+			app.descriptorSetLayout,
+		},
+	})
 	if err != nil {
 		return err
 	}
@@ -992,6 +1058,22 @@ func (app *HelloTriangleApplication) createIndexBuffer() error {
 	}
 
 	return app.copyBuffer(stagingBuffer, app.indexBuffer, bufferSize)
+}
+
+func (app *HelloTriangleApplication) createUniformBuffers() error {
+	bufferSize := int(unsafe.Sizeof(UniformBufferObject{}))
+
+	for i := 0; i < len(app.swapchainImages); i++ {
+		buffer, memory, err := app.createBuffer(bufferSize, core1_0.BufferUsageUniformBuffer, core1_0.MemoryPropertyHostVisible|core1_0.MemoryPropertyHostCoherent)
+		if err != nil {
+			return err
+		}
+
+		app.uniformBuffers = append(app.uniformBuffers, buffer)
+		app.uniformBuffersMemory = append(app.uniformBuffersMemory, memory)
+	}
+
+	return nil
 }
 
 func (app *HelloTriangleApplication) createBuffer(size int, usage core1_0.BufferUsageFlags, properties core1_0.MemoryPropertyFlags) (core1_0.Buffer, core1_0.DeviceMemory, error) {
@@ -1191,6 +1273,11 @@ func (app *HelloTriangleApplication) drawFrame() error {
 		return err
 	}
 
+	err = app.updateUniformBuffer(imageIndex)
+	if err != nil {
+		return err
+	}
+
 	_, err = app.graphicsQueue.Submit(app.inFlightFence[app.currentFrame], []core1_0.SubmitInfo{
 		{
 			WaitSemaphores:   []core1_0.Semaphore{app.imageAvailableSemaphore[app.currentFrame]},
@@ -1217,6 +1304,24 @@ func (app *HelloTriangleApplication) drawFrame() error {
 	app.currentFrame = (app.currentFrame + 1) % MaxFramesInFlight
 
 	return nil
+}
+
+func (app *HelloTriangleApplication) updateUniformBuffer(currentImage int) error {
+	currentTime := hrtime.Now().Seconds()
+	timePeriod := math.Mod(currentTime, 4.0)
+
+	ubo := UniformBufferObject{}
+	ubo.Model.SetRotationZ(timePeriod * math.Pi / 2.0)
+	ubo.View.SetLookAt(
+		&vkngmath.Vec3[float32]{X: 2, Y: 2, Z: 2},
+		&vkngmath.Vec3[float32]{X: 0, Y: 0, Z: 0},
+		&vkngmath.Vec3[float32]{X: 0, Y: 0, Z: 1},
+	)
+	aspectRatio := float32(app.swapchainExtent.Width) / float32(app.swapchainExtent.Height)
+	ubo.Proj.SetPerspective(math.Pi/4.0, aspectRatio, 0.1, 10)
+
+	err := writeData(app.uniformBuffersMemory[currentImage], 0, &ubo)
+	return err
 }
 
 func (app *HelloTriangleApplication) chooseSwapSurfaceFormat(availableFormats []khr_surface.SurfaceFormat) khr_surface.SurfaceFormat {
