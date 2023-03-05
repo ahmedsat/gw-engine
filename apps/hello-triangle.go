@@ -1,7 +1,10 @@
 package apps
 
 import (
+	"bytes"
 	"embed"
+	"encoding/binary"
+	"unsafe"
 
 	"github.com/ahmedsat/gw-engine/log"
 
@@ -41,6 +44,48 @@ type SwapChainSupportDetails struct {
 	PresentModes []khr_surface.PresentMode
 }
 
+type Vec2 struct {
+	X, Y float32
+}
+
+type Color struct {
+	R, G, B float32
+}
+
+type Vertex struct {
+	Vec2
+	Color
+}
+
+func getVertexBindingDescription() []core1_0.VertexInputBindingDescription {
+	v := Vertex{}
+	return []core1_0.VertexInputBindingDescription{
+		{
+			Binding:   0,
+			Stride:    int(unsafe.Sizeof(v)),
+			InputRate: core1_0.VertexInputRateVertex,
+		},
+	}
+}
+
+func getVertexAttributeDescriptions() []core1_0.VertexInputAttributeDescription {
+	v := Vertex{}
+	return []core1_0.VertexInputAttributeDescription{
+		{
+			Binding:  0,
+			Location: 0,
+			Format:   core1_0.FormatR32G32SignedFloat,
+			Offset:   int(unsafe.Offsetof(v.X)),
+		},
+		{
+			Binding:  0,
+			Location: 1,
+			Format:   core1_0.FormatR32G32B32SignedFloat,
+			Offset:   int(unsafe.Offsetof(v.R)),
+		},
+	}
+}
+
 type HelloTriangleApplication struct {
 	window *sdl.Window
 	loader core.Loader // ? Loader is the root object of vkng
@@ -76,7 +121,11 @@ type HelloTriangleApplication struct {
 	imagesInFlight          []core1_0.Fence
 	currentFrame            int
 
-	Shaders embed.FS
+	vertexBuffer       core1_0.Buffer
+	vertexBufferMemory core1_0.DeviceMemory
+
+	Shaders  embed.FS
+	Vertices []Vertex
 }
 
 func (app *HelloTriangleApplication) Run() error {
@@ -165,6 +214,11 @@ func (app *HelloTriangleApplication) initVulkan() error {
 	}
 
 	err = app.createCommandPool()
+	if err != nil {
+		return err
+	}
+
+	err = app.createVertexBuffer()
 	if err != nil {
 		return err
 	}
@@ -259,6 +313,14 @@ func (app *HelloTriangleApplication) cleanupSwapChain() {
 
 func (app *HelloTriangleApplication) cleanup() {
 	app.cleanupSwapChain()
+
+	if app.vertexBuffer != nil {
+		app.vertexBuffer.Destroy(nil)
+	}
+
+	if app.vertexBufferMemory != nil {
+		app.vertexBufferMemory.Free(nil)
+	}
 
 	for _, fence := range app.inFlightFence {
 		fence.Destroy(nil)
@@ -702,7 +764,10 @@ func (app *HelloTriangleApplication) createGraphicsPipeline() error {
 	}
 	defer fragShader.Destroy(nil)
 
-	vertexInput := &core1_0.PipelineVertexInputStateCreateInfo{}
+	vertexInput := &core1_0.PipelineVertexInputStateCreateInfo{
+		VertexBindingDescriptions:   getVertexBindingDescription(),
+		VertexAttributeDescriptions: getVertexAttributeDescriptions(),
+	}
 
 	inputAssembly := &core1_0.PipelineInputAssemblyStateCreateInfo{
 		Topology:               core1_0.PrimitiveTopologyTriangleList,
@@ -842,6 +907,69 @@ func (app *HelloTriangleApplication) createCommandPool() error {
 	return nil
 }
 
+func (app *HelloTriangleApplication) createVertexBuffer() error {
+	var err error
+	bufferSize := binary.Size(app.Vertices)
+	app.vertexBuffer, _, err = app.device.CreateBuffer(nil, core1_0.BufferCreateInfo{
+		Size:        bufferSize,
+		Usage:       core1_0.BufferUsageVertexBuffer,
+		SharingMode: core1_0.SharingModeExclusive,
+	})
+	if err != nil {
+		return err
+	}
+
+	memRequirements := app.vertexBuffer.MemoryRequirements()
+	memoryTypeIndex, err := app.findMemoryType(memRequirements.MemoryTypeBits, core1_0.MemoryPropertyHostVisible|core1_0.MemoryPropertyHostCoherent)
+	if err != nil {
+		return err
+	}
+
+	app.vertexBufferMemory, _, err = app.device.AllocateMemory(nil, core1_0.MemoryAllocateInfo{
+		AllocationSize:  memRequirements.Size,
+		MemoryTypeIndex: memoryTypeIndex,
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = app.vertexBuffer.BindBufferMemory(app.vertexBufferMemory, 0)
+	if err != nil {
+		return err
+	}
+
+	memory, _, err := app.vertexBufferMemory.Map(0, bufferSize, 0)
+	if err != nil {
+		return err
+	}
+	defer app.vertexBufferMemory.Unmap()
+
+	dataBuffer := unsafe.Slice((*byte)(memory), bufferSize)
+
+	buf := &bytes.Buffer{}
+	err = binary.Write(buf, common.ByteOrder, app.Vertices)
+	if err != nil {
+		return err
+	}
+
+	copy(dataBuffer, buf.Bytes())
+
+	return nil
+}
+
+func (app *HelloTriangleApplication) findMemoryType(typeFilter uint32, properties core1_0.MemoryPropertyFlags) (int, error) {
+	memProperties := app.physicalDevice.MemoryProperties()
+	for i, memoryType := range memProperties.MemoryTypes {
+		typeBit := uint32(1 << i)
+
+		if (typeFilter&typeBit) != 0 && (memoryType.PropertyFlags&properties) == properties {
+			return i, nil
+		}
+	}
+
+	return 0, errors.New("failed to find any suitable memory type!")
+}
+
 func (app *HelloTriangleApplication) createCommandBuffers() error {
 
 	buffers, _, err := app.device.AllocateCommandBuffers(core1_0.CommandBufferAllocateInfo{
@@ -877,7 +1005,8 @@ func (app *HelloTriangleApplication) createCommandBuffers() error {
 		}
 
 		buffer.CmdBindPipeline(core1_0.PipelineBindPointGraphics, app.graphicsPipeline)
-		buffer.CmdDraw(3, 1, 0, 0)
+		buffer.CmdBindVertexBuffers(0, []core1_0.Buffer{app.vertexBuffer}, []int{0})
+		buffer.CmdDraw(len(app.Vertices), 1, 0, 0)
 		buffer.CmdEndRenderPass()
 
 		_, err = buffer.End()
