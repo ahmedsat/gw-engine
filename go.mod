@@ -5,12 +5,10 @@ go 1.19
 require (
 	github.com/TwiN/go-color v1.4.0
 	github.com/cockroachdb/errors v1.9.0
-	github.com/loov/hrtime v1.0.3
 	github.com/veandco/go-sdl2 v0.4.33
 	github.com/vkngwrapper/core/v2 v2.1.1
 	github.com/vkngwrapper/extensions/v2 v2.1.0
 	github.com/vkngwrapper/integrations/sdl2/v2 v2.0.2
-	github.com/vkngwrapper/math v1.1.1
 )
 
 require (
